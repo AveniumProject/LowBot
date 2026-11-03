@@ -98,6 +98,8 @@ public class LowBotApp extends Application {
                 String t = e.optString("type");
                 if (t.startsWith("run.") || t.startsWith("task.") || t.startsWith("bot.") || t.startsWith("approval.")) BotsWidget.requestRefresh(LowBotApp.this);
                 if (t.startsWith("widget.") || t.startsWith("bot.")) CardWidget.requestRefresh(LowBotApp.this);
+                // Stop: the bot's browser page stops loading and rendering in the background.
+                if (t.equals("task.cancelled")) computer.quiet(J.str(e, "bot_id", null));
             }
         });
         backend.start();

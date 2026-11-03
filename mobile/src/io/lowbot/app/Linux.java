@@ -51,7 +51,7 @@ import io.lowbot.tools.Builtin;
  * the normal approval gateway instead.
  */
 public final class Linux {
-    static final int LOG_MAX = 96 * 1024, OUT_MAX = 16000;
+    static final int LOG_MAX = 96 * 1024, OUT_MAX = 16000, PENDING_MAX = 256 * 1024;
     final Context app;
     final Backend backend;
     final File base, rootfs, tmp;
@@ -216,7 +216,12 @@ public final class Linux {
                 try {
                     while ((n = out.read(buf)) > 0) {
                         String s = new String(buf, 0, n, StandardCharsets.UTF_8);
-                        synchronized (Session.this) { pending.append(s); Session.this.notifyAll(); }
+                        synchronized (Session.this) {
+                            pending.append(s);
+                            // Background jobs can print forever between commands: keep only the tail (a command's result marker is at the end).
+                            if (pending.length() > PENDING_MAX) pending.delete(0, pending.length() - PENDING_MAX / 2);
+                            Session.this.notifyAll();
+                        }
                     }
                 } catch (Exception ignored) { }
                 synchronized (Session.this) { Session.this.notifyAll(); }
@@ -375,7 +380,16 @@ public final class Linux {
                         throw new ToolError((left <= 0 ? "Command timed out after " + timeoutS + " s" : "Cancelled")
                                 + "; the terminal was restarted (cd and variables reset). Partial output: " + J.redact(tail(text, 4000)));
                     }
-                    try { s.wait(Math.min(left, 1000)); } catch (InterruptedException e) { throw new ToolError("Interrupted."); }
+                    try {
+                        s.wait(Math.min(left, 1000));
+                    } catch (InterruptedException e) {
+                        // Stop (or the tool's timeout) gave up on this command: kill it instead of leaving it running in the background.
+                        s.kill();
+                        sessions.remove(botId, s);
+                        s.appendLog(text + "\n[stopped — terminal restarted]\n");
+                        emit();
+                        throw new ToolError("Stopped; the terminal was restarted (cd and variables reset). Partial output: " + J.redact(tail(text, 4000)));
+                    }
                 }
             }
         } finally {

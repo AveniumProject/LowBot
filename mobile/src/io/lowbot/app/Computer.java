@@ -80,6 +80,8 @@ public final class Computer {
         volatile boolean busy;
         volatile CountDownLatch loading;
         volatile boolean recording;
+        /** Paused after Stop (WebView.onPause on every tab) until the bot or a person uses it again. */
+        volatile boolean quiet;
         Surface(String id, String botId, WebView web) { this.id = id; this.botId = botId; this.web = web; tabs.add(web); }
         public String botName() {
             JSONObject b = backend.bots.get(botId);
@@ -260,6 +262,36 @@ public final class Computer {
         if (oldest != null) close(oldest);
     }
 
+    /**
+     * After Stop: the bot's pages stop loading and go quiet. They stay parked behind the app UI, so a busy page
+     * (video, animations, scripts) would otherwise keep rendering and slow the app down although the bot stopped.
+     * The next bot action or a takeover resumes them. Does nothing while the bot still has a running task.
+     */
+    public void quiet(String botId) {
+        if (botId == null || db.count("SELECT COUNT(*) FROM runs WHERE bot_id = ? AND status = 'running'", botId) > 0) return;
+        String sid = db.scalar("SELECT id FROM computer_sessions WHERE bot_id = ?", botId);
+        final Surface s = sid == null ? null : surfaces.get(sid);
+        if (s == null || s.quiet || controller(sid).startsWith("human:")) return;
+        s.quiet = true;
+        main.post(new Runnable() { public void run() {
+            if (!s.quiet) return; // already used again
+            for (WebView w : s.tabs) { w.stopLoading(); w.onPause(); }
+        } });
+    }
+
+    /** Main thread. */
+    void resumeTabs(Surface s) {
+        s.quiet = false;
+        for (WebView w : s.tabs) w.onResume();
+        s.web.invalidate();
+    }
+
+    void unquiet(final Surface s) throws ToolError {
+        if (!s.quiet) return;
+        onMain(new Callable<Void>() { public Void call() { resumeTabs(s); return null; } }, 5000);
+        try { Thread.sleep(250); } catch (InterruptedException e) { throw new ToolError("Interrupted."); } // let the page draw a fresh frame
+    }
+
     public void close(final String sid) {
         final Surface s = surfaces.remove(sid);
         if (s == null) return;
@@ -405,6 +437,7 @@ public final class Computer {
                 return new Tools.Wait("input", J.obj("reason", "takeover", "surface_id", s.id, "question", "A person has taken over this computer. Waiting for Resume."));
             s.busy = true;
             try {
+                unquiet(s);
                 return fn.run(s);
             } finally {
                 s.busy = false;
@@ -494,7 +527,11 @@ public final class Computer {
             backend.core.emit("computer.taken_over", null, null, null, row.optString("bot_id"), J.obj("surface_id", sid));
             backend.core.audit("computer.takeover", "user", Core.OWNER, null, null, null, null, null, J.obj("surface_id", sid));
         } });
-        if (s != null) main.post(new Runnable() { public void run() { Host h = host; if (h != null) h.showTakeover(s); } });
+        if (s != null) main.post(new Runnable() { public void run() {
+            if (s.quiet) resumeTabs(s);
+            Host h = host;
+            if (h != null) h.showTakeover(s);
+        } });
         return db.one("SELECT * FROM computer_sessions WHERE id = ?", sid);
     }
 

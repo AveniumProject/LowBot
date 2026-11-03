@@ -39,6 +39,10 @@ public final class Engine {
 
     static final class LeaseLost extends RuntimeException { LeaseLost() { super("lease lost"); } }
     static final class Parked extends RuntimeException { Parked() { super("parked"); } }
+    /** The user pressed Stop while this run waited for a model call or a tool; execute() finalizes the cancel. */
+    static final class Stopped extends RuntimeException { Stopped() { super("stopped"); } }
+    /** How often a waiting run re-checks Stop even if no interrupt reached it. */
+    static final long STOP_POLL_MS = 1000;
 
     private final Backend b;
     private final Db db;
@@ -46,6 +50,8 @@ public final class Engine {
     private final Object signal = new Object();
     private final ExecutorService pool;
     private final ExecutorService toolPool = Executors.newCachedThreadPool();
+    /** Model calls run here so the run thread can react to Stop at once instead of waiting for the provider. */
+    private final ExecutorService modelPool = Executors.newCachedThreadPool();
     private final Map<String, Thread> active = new ConcurrentHashMap<String, Thread>();
     private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
     private final Random random = new Random();
@@ -76,6 +82,7 @@ public final class Engine {
         wake();
         pool.shutdownNow();
         toolPool.shutdownNow();
+        modelPool.shutdownNow();
     }
 
     public void wake() {
@@ -85,9 +92,12 @@ public final class Engine {
         }
     }
 
-    /** Called after Stop/Pause so a running step notices quickly. */
+    /**
+     * Called after Stop so a waiting run notices at once (it would also notice within STOP_POLL_MS). Only Stop
+     * interrupts: Pause lets the current step finish. Waits ignore interrupts that are not a Stop of their own run.
+     */
     public void signalControl() {
-        for (JSONObject r : db.all("SELECT id FROM runs WHERE status = 'running' AND control != ''")) {
+        for (JSONObject r : db.all("SELECT id FROM runs WHERE status = 'running' AND control = 'cancel'")) {
             Thread t = active.get(r.optString("id"));
             if (t != null) t.interrupt();
         }
@@ -202,6 +212,7 @@ public final class Engine {
                     execute(run);
                 } finally {
                     active.remove(run.optString("id"));
+                    try { settle(run); } catch (Throwable e) { android.util.Log.e("LowBot", "settle run", e); }
                     inFlight.decrementAndGet();
                     Thread.interrupted();
                     wake();
@@ -247,6 +258,8 @@ public final class Engine {
             loop(run);
         } catch (Parked e) {
             // left running state
+        } catch (Stopped e) {
+            finalizeCancel(run);
         } catch (LeaseLost e) {
             android.util.Log.w("LowBot", "lease lost for " + run.optString("id"));
         } catch (Throwable e) {
@@ -261,6 +274,79 @@ public final class Engine {
     String control(JSONObject run) {
         String c = db.scalar("SELECT control FROM runs WHERE id = ?", run.optString("id"));
         return c == null ? "" : c;
+    }
+
+    /**
+     * The run's thread is done: the run must not stay "running" under this owner, or the bot shows as working,
+     * Stop does nothing and the work service never stops. Stopped → cancelled; anything else counts as an attempt
+     * and is queued again like after an app restart (a step that was executing is recovered the same way).
+     */
+    void settle(final JSONObject run) {
+        if (stopped) return; // engine shut down (tests): leave the run for recovery, like a dead process
+        JSONObject r = db.one("SELECT status, owner, control FROM runs WHERE id = ?", run.optString("id"));
+        if (r == null || !"running".equals(r.optString("status")) || !run.optString("owner").equals(r.optString("owner"))) return;
+        if ("cancel".equals(r.optString("control"))) { finalizeCancel(run); return; }
+        android.util.Log.w("LowBot", "run " + run.optString("id") + " was left running; requeued");
+        final String why = "The run stopped unexpectedly several times.";
+        db.tx(new Runnable() { public void run() {
+            if (db.change("UPDATE runs SET status = CASE WHEN attempt + 1 >= max_attempts THEN 'failed' ELSE 'queued' END, attempt = attempt + 1, owner = NULL, "
+                    + "updated_at = ?, error = CASE WHEN attempt + 1 >= max_attempts THEN ? ELSE error END WHERE id = ? AND owner = ? AND status = 'running'",
+                    J.nowIso(), why, run.optString("id"), run.optString("owner")) != 1) return;
+            if ("failed".equals(db.scalar("SELECT status FROM runs WHERE id = ?", run.optString("id")))) {
+                JSONObject task = b.tasks.getTask(run.optString("task_id"));
+                if (task != null) b.tasks.finishTask(task, "failed", null, why);
+            }
+            b.core.emit("run.recovered", null, run.optString("task_id"), run.optString("id"), run.optString("bot_id"), J.obj("previous_owner", run.optString("owner")));
+        } });
+    }
+
+    /**
+     * Waits for a model call or tool while watching for Stop. Stop interrupts this thread, and the run's control
+     * is also re-checked every STOP_POLL_MS (an interrupt can be lost, e.g. inside SQLite). Interrupts that are not a
+     * Stop of this run (one meant for the previous run on this pool thread) are ignored instead of failing the run.
+     * timeoutMs <= 0 waits without a limit (the call has its own timeouts).
+     */
+    <T> T waitFor(JSONObject run, Future<T> f, long timeoutMs) throws java.util.concurrent.ExecutionException, TimeoutException {
+        long deadline = timeoutMs > 0 ? System.currentTimeMillis() + timeoutMs : Long.MAX_VALUE;
+        while (true) {
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) throw new TimeoutException();
+            try {
+                return f.get(Math.min(left, STOP_POLL_MS), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                // check Stop below, then wait on
+            } catch (InterruptedException e) {
+                // check Stop below
+            }
+            if (stopped) throw new LeaseLost(); // engine shut down: give up like a dead process
+            if ("cancel".equals(control(run))) {
+                f.cancel(true);
+                throw new Stopped();
+            }
+        }
+    }
+
+    /** A model call that Stop ends at once: the HTTP connection is closed instead of waiting for the provider. */
+    Model.Response callModel(JSONObject run, final Model.Adapter adapter, final Model.Request req) throws Model.ProviderError {
+        Future<Model.Response> f = modelPool.submit(new java.util.concurrent.Callable<Model.Response>() {
+            @Override public Model.Response call() throws Exception { return adapter.complete(req); }
+        });
+        try {
+            return waitFor(run, f, 0);
+        } catch (Stopped e) {
+            req.abort();
+            throw e;
+        } catch (TimeoutException e) {
+            req.abort();
+            f.cancel(true);
+            throw new Model.ProviderError("timeout", "Model request timed out.", true, 0);
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable c = e.getCause();
+            if (c instanceof Model.ProviderError) throw (Model.ProviderError) c;
+            if (c instanceof RuntimeException) throw (RuntimeException) c;
+            if (c instanceof Error) throw (Error) c;
+            throw new Model.ProviderError("network", "Model call failed: " + c, true, 0);
+        }
     }
 
     void loop(final JSONObject run) {
@@ -362,7 +448,10 @@ public final class Engine {
         } });
         final Model.Response resp;
         try {
-            resp = res.adapter.complete(req);
+            resp = callModel(run, res.adapter, req);
+        } catch (Stopped e) {
+            b.providers.release(usageId);
+            throw e;
         } catch (Model.ProviderError e) {
             b.providers.release(usageId);
             if ("cancel".equals(control(run))) { finalizeCancel(run); throw new Parked(); }
@@ -440,7 +529,7 @@ public final class Engine {
             }
             JSONObject review = null;
             if ("ask".equals(decision) && !spec.hardAsk && b.core.kvBool("auto_review", false)) {
-                review = autoReview(bot, task, spec, args, card);
+                review = autoReview(run, bot, task, spec, args, card);
                 String d = review.optString("decision");
                 if ("allow".equals(d) || "deny".equals(d)) decision = d;
             }
@@ -562,7 +651,7 @@ public final class Engine {
     }
 
     /** Grok "Auto Review": an independent model call rates a risky action allow / require approval / deny. */
-    JSONObject autoReview(JSONObject bot, JSONObject task, Tools.Spec spec, JSONObject args, JSONObject card) {
+    JSONObject autoReview(JSONObject run, JSONObject bot, JSONObject task, Tools.Spec spec, JSONObject args, JSONObject card) {
         try {
             JSONObject reviewer = J.parse(b.core.kvGet("auto_review_bot"));
             JSONObject who = reviewer.length() > 0 ? reviewer : bot;
@@ -578,13 +667,15 @@ public final class Engine {
             req.messages.add(J.obj("role", "user", "content", "User's request:\n" + J.truncate(task.optString("instructions"), 2000)
                     + "\n\nProposed action: " + spec.name + " — " + card.optString("summary") + "\nEffect: " + card.optString("effect")
                     + "\nArguments (untrusted): " + J.truncate(J.redactObj(args).toString(), 3000)));
-            Model.Response r = res.adapter.complete(req);
+            Model.Response r = callModel(run, res.adapter, req);
             String text = r.text.trim();
             int s = text.indexOf('{'), e = text.lastIndexOf('}');
             JSONObject v = s >= 0 && e > s ? J.parse(text.substring(s, e + 1)) : new JSONObject();
             String d = v.optString("decision");
             if (!"allow".equals(d) && !"deny".equals(d)) d = "ask";
             return J.obj("decision", d, "reason", J.truncate(v.optString("reason", "no reason given"), 300), "model", res.model);
+        } catch (Stopped e) {
+            throw e;
         } catch (Exception e) {
             return J.obj("decision", "ask", "reason", "Auto Review unavailable: " + e.getMessage());
         }
@@ -619,7 +710,8 @@ public final class Engine {
             @Override public Object call() throws Exception { return spec.exec.run(ctx, args); }
         });
         try {
-            result = f.get(spec.timeoutS, TimeUnit.SECONDS);
+            // Stop cancels the tool (its thread is interrupted: a Linux command is killed, a page wait ends) and the run at once.
+            result = waitFor(run, f, spec.timeoutS * 1000L);
         } catch (java.util.concurrent.ExecutionException e) {
             Throwable c = e.getCause();
             result = null;
@@ -630,10 +722,6 @@ public final class Engine {
             f.cancel(true);
             result = null;
             err = "Tool timed out.";
-        } catch (InterruptedException e) {
-            f.cancel(true);
-            if ("cancel".equals(control(run))) { finalizeCancel(run); throw new Parked(); }
-            throw new LeaseLost();
         }
         if (err != null) {
             final String e2 = J.redact(err);
@@ -850,7 +938,9 @@ public final class Engine {
                 + "\n\nWrite the new handoff now."));
         String handoff;
         try {
-            handoff = res.adapter.complete(req).text.trim();
+            handoff = callModel(run, res.adapter, req).text.trim();
+        } catch (Stopped e) {
+            throw e;
         } catch (Exception e) {
             return; // keep the longer context this time; try again on the next step
         }

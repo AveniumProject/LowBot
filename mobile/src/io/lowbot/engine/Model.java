@@ -43,6 +43,29 @@ public final class Model {
         public int timeoutS = 120;
         /** Conversation (or task) this request belongs to; sent to providers that route by session (OpenCode Go). */
         public String session;
+
+        private volatile HttpURLConnection conn;
+        private volatile boolean aborted;
+
+        /** Adapters register their open connection here so Stop can close it instead of waiting for the provider. */
+        public void attach(HttpURLConnection c) throws java.io.InterruptedIOException {
+            conn = c;
+            if (aborted) { c.disconnect(); throw new java.io.InterruptedIOException("request aborted"); }
+        }
+
+        /** Closes the open connection (a blocked read fails at once); later attach() calls fail. Any thread. */
+        public void abort() {
+            aborted = true;
+            HttpURLConnection c = conn;
+            if (c != null) try { c.disconnect(); } catch (Exception ignored) { }
+        }
+
+        public boolean aborted() { return aborted; }
+
+        /** After the request is sent: an abort that came while connecting (when disconnect cannot close anything yet) ends it here. */
+        public void throwIfAborted() throws java.io.InterruptedIOException {
+            if (aborted) throw new java.io.InterruptedIOException("request aborted");
+        }
     }
 
     public static final class ToolCall {
@@ -151,13 +174,19 @@ public final class Model {
         }
 
         JSONObject post(String path, JSONObject body, int timeoutS, String session) throws ProviderError {
+            return post(path, body, timeoutS, session, null);
+        }
+
+        JSONObject post(String path, JSONObject body, int timeoutS, String session, Request req) throws ProviderError {
             HttpURLConnection c = null;
             try {
                 c = open(path, "POST", timeoutS, session);
+                if (req != null) req.attach(c);
                 c.setDoOutput(true);
                 OutputStream os = c.getOutputStream();
                 os.write(body.toString().getBytes(StandardCharsets.UTF_8));
                 os.close();
+                if (req != null) req.throwIfAborted();
                 int code = c.getResponseCode();
                 String text = read(code >= 400 ? c.getErrorStream() : c.getInputStream());
                 if (code < 200 || code >= 300) throw classify(code, c.getHeaderField("Retry-After"), errorDetail(text));
@@ -274,7 +303,7 @@ public final class Model {
         }
 
         @Override public Response complete(Request req) throws ProviderError {
-            JSONObject data = post("/chat/completions", body(req), req.timeoutS, req.session);
+            JSONObject data = post("/chat/completions", body(req), req.timeoutS, req.session, req);
             JSONArray choices = data.optJSONArray("choices");
             if (choices == null || choices.length() == 0) throw new ProviderError("server", "Provider returned no choices.", true, 0);
             JSONObject msg = choices.optJSONObject(0).optJSONObject("message");
@@ -300,7 +329,7 @@ public final class Model {
         public Responses(String base, String key, JSONObject headers) throws ProviderError { super(base, key, headers); }
 
         @Override public Response complete(Request req) throws ProviderError {
-            JSONObject data = post("/responses", body(req), req.timeoutS, req.session);
+            JSONObject data = post("/responses", body(req), req.timeoutS, req.session, req);
             return parse(data);
         }
 
@@ -377,7 +406,20 @@ public final class Model {
 
         public Scripted(JSONArray script) { this.script = script == null ? new JSONArray() : script; }
 
-        @Override public synchronized Response complete(Request req) {
+        @Override public Response complete(Request req) throws ProviderError {
+            long[] delay = new long[1];
+            Response r = respond(req, delay);
+            // "delay_ms" in a rule: a slow provider (self-test of Stop). Ends early when the request is aborted or interrupted.
+            long until = System.currentTimeMillis() + delay[0];
+            while (System.currentTimeMillis() < until) {
+                if (req.aborted()) throw new ProviderError("network", "Request aborted.", true, 0);
+                try { Thread.sleep(Math.min(50, Math.max(1, until - System.currentTimeMillis()))); }
+                catch (InterruptedException e) { throw new ProviderError("network", "Interrupted.", true, 0); }
+            }
+            return r;
+        }
+
+        synchronized Response respond(Request req, long[] delay) {
             n++;
             JSONObject last = req.messages.isEmpty() ? J.obj("role", "user", "content", "") : req.messages.get(req.messages.size() - 1);
             String lastText = last.optString("content");
@@ -402,6 +444,7 @@ public final class Model {
                     if (tools >= rule.optInt("tool_msgs_below")) continue;
                 }
                 if (rule.has("when") && !Pattern.compile(rule.optString("when"), Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(lastText).find()) continue;
+                delay[0] = rule.optLong("delay_ms", 0);
                 JSONArray calls = rule.optJSONArray("calls");
                 if (calls == null && rule.optJSONObject("call") != null) calls = new JSONArray().put(rule.optJSONObject("call"));
                 if (calls != null && calls.length() > 0) {

@@ -118,6 +118,7 @@ public class SelfTest extends BroadcastReceiver {
                         J.obj("title", "BTC", "stat", J.obj("value", "59 800 $", "label", "BTC", "change", "-3.2%", "trend", new JSONArray().put(61000).put(60500).put(59800))))))
                 .put(J.obj("after_tool", "widget.create", "reply", "widget made"))
                 .put(J.obj("when", "say nothing", "reply", ""))
+                .put(J.obj("when", "think slowly", "delay_ms", 30000, "reply", "slow answer"))
                 .put(J.obj("when", "write a file", "call", J.obj("name", "workspace.write", "arguments", J.obj("path", "notes/a.txt", "content", "hello phone"))))
                 .put(J.obj("after_tool", "workspace.write", "reply", "file written"))
                 .put(J.obj("when", "post it", "call", J.obj("name", "http.post", "arguments", J.obj("url", "https://example.invalid/hook", "json", J.obj("a", 1)))))
@@ -398,6 +399,24 @@ public class SelfTest extends BroadcastReceiver {
         b.core.db.exec("UPDATE runs SET deadline_at = ? WHERE task_id = ?", "2000-01-01T00:00:00.000Z", tOld.optString("id"));
         b.engine.drain(20000);
         check("completed".equals(b.core.db.scalar("SELECT status FROM tasks WHERE id = ?", tOld.optString("id"))), "no run time limit: a run past its old deadline completes");
+
+        // 7e4. Stop during a slow model call ends the run at once (it used to wait for the provider's answer while the
+        // bot still counted as working), and nothing is left running afterwards.
+        JSONObject tSlow = api(r, "POST", "/api/v2/conversations/" + cid + "/messages", J.obj("text", "think slowly")).optJSONArray("tasks").getJSONObject(0);
+        long until = System.currentTimeMillis() + 10000;
+        while (b.core.db.count("SELECT COUNT(*) FROM runs WHERE task_id = ? AND status = 'running' AND phase != ''", tSlow.optString("id")) == 0
+                && System.currentTimeMillis() < until) Thread.sleep(50);
+        Thread.sleep(500); // inside the 30 s model call
+        long stopAt = System.currentTimeMillis();
+        api(r, "POST", "/api/v2/tasks/" + tSlow.optString("id") + "/cancel", null);
+        while (!"cancelled".equals(runStatus(b, tSlow.optString("id"))) && System.currentTimeMillis() < stopAt + 10000) Thread.sleep(50);
+        long took = System.currentTimeMillis() - stopAt;
+        check("cancelled".equals(runStatus(b, tSlow.optString("id"))) && took < 4000, "Stop ends a slow model call at once (" + took + " ms)");
+        b.engine.drain(20000);
+        check(b.core.db.count("SELECT COUNT(*) FROM runs WHERE status = 'running'") == 0 && b.engine.activeCount() == 0
+                && "cancelled".equals(b.core.db.scalar("SELECT status FROM tasks WHERE id = ?", tSlow.optString("id")))
+                && b.core.db.count("SELECT COUNT(*) FROM messages WHERE task_id = ? AND text = 'slow answer'", tSlow.optString("id")) == 0,
+                "after Stop nothing stays running and the late answer is dropped");
 
         // 7f. Default: no approvals except Linux install and actions the bot itself flags as dangerous
         b.core.kvSet("ask_before_actions", "0");

@@ -274,7 +274,7 @@ public final class ChatGpt {
                 try {
                     return call(req, false);
                 } catch (Model.ProviderError e) {
-                    if ("auth".equals(e.kind)) return call(req, true); // refresh once on 401
+                    if ("auth".equals(e.kind) && !req.aborted()) return call(req, true); // refresh once on 401
                     throw e;
                 }
             }
@@ -321,11 +321,13 @@ public final class ChatGpt {
         HttpURLConnection c = null;
         try {
             c = open(t, "/responses", "POST", req.timeoutS);
+            req.attach(c);
             c.setDoOutput(true);
             c.setRequestProperty("Accept", "text/event-stream");
             OutputStream o = c.getOutputStream();
             o.write(body.toString().getBytes(StandardCharsets.UTF_8));
             o.close();
+            req.throwIfAborted();
             int code = c.getResponseCode();
             if (code < 200 || code >= 300) {
                 String detail = Model.errorDetailPublic(read(c.getErrorStream()));

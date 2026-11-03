@@ -16,20 +16,32 @@ import android.os.IBinder;
  */
 public class WorkService extends Service {
     static volatile boolean running = false;
+    /** The count the notification shows (or was asked to show). */
+    private static int shown = -1;
+    private static final java.util.concurrent.ExecutorService BG = java.util.concurrent.Executors.newSingleThreadExecutor();
 
-    static void update(Context ctx, int active, int queued) {
+    /**
+     * Every start runs onStartCommand on the main thread, so a start is sent only when the service is not running
+     * yet or the number in the notification changes — not on every wake (that used to be a start ↔ wake loop that
+     * kept the main thread busy for as long as anything was queued or running, e.g. a run that Stop had not ended yet).
+     */
+    static synchronized void update(Context ctx, int active, int queued) {
         Context app = ctx.getApplicationContext();
         if (queued > 0 && !running) {
             try {
                 Intent i = new Intent(app, WorkService.class).putExtra("n", queued);
                 app.startForegroundService(i);
+                shown = queued;
             } catch (Exception ignored) {
                 // Background start restrictions: work still continues while the app is open.
             }
         } else if (queued > 0) {
+            if (queued == shown) return;
+            shown = queued;
             Intent i = new Intent(app, WorkService.class).putExtra("n", queued);
             try { app.startService(i); } catch (Exception ignored) { }
         } else if (running) {
+            shown = -1;
             app.stopService(new Intent(app, WorkService.class));
         }
     }
@@ -48,7 +60,10 @@ public class WorkService extends Service {
         if (Build.VERSION.SDK_INT >= 29) startForeground(42, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         else startForeground(42, notif);
         running = true;
-        LowBotApp.of(this).backend.wake();
+        // Off the main thread: wakes the engine and re-checks the work count once (stops the service if the work
+        // ended before this start arrived). update() sends no new start for the same count, so this cannot loop.
+        final io.lowbot.core.Backend b = LowBotApp.of(this).backend;
+        BG.execute(new Runnable() { public void run() { b.wake(); } });
         return START_STICKY;
     }
 
@@ -61,6 +76,7 @@ public class WorkService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        synchronized (WorkService.class) { shown = -1; }
         super.onDestroy();
     }
 
