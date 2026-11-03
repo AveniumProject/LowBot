@@ -140,6 +140,9 @@ public final class Router {
             if ("members".equals(sub) && post) return Response.json(b.tasks.addMember(id, body.optString("bot_id")));
             if ("messages".equals(sub) && get) {
                 b.tasks.getConversation(id);
+                // ?tail=N: the newest N messages (optionally before=seq) — a chat opens at its end and loads older ones on request.
+                if (q(u, "tail", null) != null)
+                    return Response.json(b.tasks.lastMessages(id, Long.parseLong(q(u, "before", "0")), qi(u, "tail", 100, 500)));
                 return Response.json(b.tasks.messages(id, Long.parseLong(q(u, "after", "0")), qi(u, "limit", 200, 500)));
             }
             if ("messages".equals(sub) && post) {

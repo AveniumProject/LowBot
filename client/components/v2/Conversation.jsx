@@ -1,5 +1,5 @@
 'use client';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -149,7 +149,13 @@ function withSecretChips(text) {
   });
 }
 
-function Bubble({ m, bot, showName, onOpenComputer, animate, ws }) {
+// A chat with many messages must not re-parse every bubble's Markdown on each keystroke or refresh: a bubble
+// re-renders only when its own message, its bot's look or its position flags change (widget cards follow ws).
+const sameBot = (a, b) => a === b || (!!a && !!b && a.id === b.id && a.name === b.name && a.avatar === b.avatar);
+const Bubble = memo(BubbleView, (p, n) => p.m === n.m && sameBot(p.bot, n.bot) && p.showName === n.showName && p.animate === n.animate
+  && p.onOpenComputer === n.onOpenComputer && (!n.m.meta?.widget_id || p.ws === n.ws));
+
+function BubbleView({ m, bot, showName, onOpenComputer, animate, ws }) {
   if (m.meta?.secret_request && m.author_type === 'bot') return <SecretCard m={m} />;
   if (m.meta?.takeover_request && m.author_type === 'bot') return <TakeoverCard m={m} onOpenComputer={onOpenComputer} />;
   if (m.author_type === 'system' && m.meta?.handoff && /^🔁/.test(m.text || '')) return null; // old "wrote a handoff" notices
@@ -224,6 +230,16 @@ function ApprovalInline({ a, ws, onChanged }) {
   );
 }
 
+const PAGE = 100; // messages shown when a chat opens; "Earlier messages" loads more
+
+// Adds rows to the loaded messages (by id, in seq order) and keeps the same array when nothing is new.
+function mergeMessages(prev, rows) {
+  const have = new Set(prev.map((m) => m.id));
+  const add = rows.filter((m) => !have.has(m.id));
+  if (!add.length) return prev;
+  return prev.concat(add).sort((a, b) => a.seq - b.seq);
+}
+
 // Grok-style "<bot> is working" line: the bot's character plus a shimmering status text.
 const WORK_PHRASE = { running: 'is working', queued: 'is working', retry_scheduled: 'is retrying', waiting_dependency: 'is waiting for another bot',
   waiting_approval: 'is waiting for your approval', waiting_input: 'is asking you', paused: 'is paused', unknown_outcome: 'needs you to check a result' };
@@ -257,6 +273,9 @@ function WorkingStrip({ task, bot, onAnswer, special }) {
 export default function Conversation({ conversation, ws, onBack, skills, onOpenBot, onOpenComputer }) {
   const { t, lang } = useT();
   const [messages, setMessages] = useState([]);
+  const [hasEarlier, setHasEarlier] = useState(false);
+  const lastSeq = useRef(0); // newest message loaded: refreshes fetch only what came after it
+  const readSeq = useRef(0); // newest message already reported as read
   const [approvals, setApprovals] = useState([]);
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState([]);
@@ -284,22 +303,41 @@ export default function Conversation({ conversation, ws, onBack, skills, onOpenB
   const convTaskIds = new Set(ws.tasks.filter((x) => x.conversation_id === conversation.id).map((x) => x.id));
   const elicitations = ws.elicitations.filter((e) => convTaskIds.has(e.task_id));
 
+  // Messages never change once written, so the chat opens with the newest PAGE messages and each refresh
+  // (every event while bots work) fetches only newer ones instead of the whole history.
   const load = useCallback(async () => {
+    const first = lastSeq.current === 0;
     const [rows, apr] = await Promise.all([
-      api(`/conversations/${conversation.id}/messages?limit=500`),
+      api(first ? `/conversations/${conversation.id}/messages?tail=${PAGE}` : `/conversations/${conversation.id}/messages?after=${lastSeq.current}&limit=500`),
       api('/approvals?status=').catch(() => []),
     ]);
-    setMessages(rows);
+    if (rows.length) {
+      lastSeq.current = Math.max(lastSeq.current, rows[rows.length - 1].seq);
+      if (first) setHasEarlier(rows.length >= PAGE);
+      setMessages((prev) => mergeMessages(prev, rows));
+    }
     setApprovals(apr.filter((a) => a.conversation_id === conversation.id && a.status !== 'invalidated'));
-    if (rows.length) api(`/conversations/${conversation.id}/read`, { method: 'POST', body: { seq: rows[rows.length - 1].seq } }).catch(() => {});
+    if (lastSeq.current > readSeq.current) {
+      readSeq.current = lastSeq.current;
+      api(`/conversations/${conversation.id}/read`, { method: 'POST', body: { seq: lastSeq.current } }).catch(() => {});
+    }
   }, [conversation.id]);
+
+  const loadEarlier = async () => {
+    if (!messages.length) return;
+    const rows = await api(`/conversations/${conversation.id}/messages?tail=${PAGE}&before=${messages[0].seq}`).catch(() => null);
+    if (!rows) return;
+    setHasEarlier(rows.length >= PAGE);
+    setMessages((prev) => mergeMessages(prev, rows));
+  };
 
   useEffect(() => { load(); }, [load, ws.tick]);
   // Text shared from another app (Android share sheet) lands in the composer.
   useEffect(() => {
     if (window.__lowbotPendingShare) { setText(window.__lowbotPendingShare); window.__lowbotPendingShare = null; }
   }, []);
-  useEffect(() => { endRef.current?.scrollIntoView({ block: 'end' }); }, [messages.length, approvals.length, activeTasks.length]);
+  const newestId = messages.length ? messages[messages.length - 1].id : '';
+  useEffect(() => { endRef.current?.scrollIntoView({ block: 'end' }); }, [newestId, approvals.length, activeTasks.length]);
 
   // Timeline: messages and approval cards ordered by time.
   const timeline = useMemo(() => messages.map((m) => ({ kind: 'msg', at: m.created_at, m }))
@@ -429,7 +467,8 @@ export default function Conversation({ conversation, ws, onBack, skills, onOpenB
     return out;
   }, [messages]);
 
-  const openComputer = async (target) => {
+  const openComputerImpl = useRef(null);
+  openComputerImpl.current = async (target) => {
     if (local) {
       try { await api('/computers/open', { method: 'POST', body: { bot_id: target?.bot_id || target?.id || lead?.id } }); }
       catch (err) { setError(err.message); }
@@ -437,6 +476,7 @@ export default function Conversation({ conversation, ws, onBack, skills, onOpenB
     }
     onOpenComputer?.(lead);
   };
+  const openComputer = useCallback((target) => openComputerImpl.current(target), []); // stable, so bubbles stay memoized
 
   const pending = pendingOutbox(conversation.id);
   const title = conversation.title || (conversation.kind === 'group' ? members.map((b) => b.name).join(', ') : lead?.name);
@@ -461,6 +501,11 @@ export default function Conversation({ conversation, ws, onBack, skills, onOpenB
       </header>
 
       <div className="flex-1 overflow-y-auto px-4 pt-20 pb-2 min-h-0">
+        {hasEarlier && (
+          <div className="flex justify-center my-2">
+            <button type="button" onClick={loadEarlier} className="lb-press rounded-full bg-[#2a2a2a] px-4 py-2 text-[14px] text-zinc-300">{'Earlier messages'}</button>
+          </div>
+        )}
         {timeline.map((it, i) => {
           const at = new Date(it.at).getTime();
           const sep = lastAt === null || at - lastAt > 10 * 60 * 1000;

@@ -109,4 +109,26 @@ final class Schema {
     static final String[] V5 = {
         "ALTER TABLE runs ADD COLUMN phase TEXT",
     };
+
+    /**
+     * v6: indexes for lookups that run on every model step, task end or chat refresh. Without them each one
+     * scanned whole tables, so the app got slower with every message sent.
+     */
+    static final String[] V6 = {
+        "CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_runs_bot ON runs(bot_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_conv ON tasks(conversation_id, unread)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source_message_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_handoffs_to ON handoffs(to_task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_handoffs_from ON handoffs(from_task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_approvals_step ON approvals(step_id)",
+        "CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_approvals_created ON approvals(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_usage_bot ON usage_entries(bot_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_usage_run ON usage_entries(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at)",
+    };
 }

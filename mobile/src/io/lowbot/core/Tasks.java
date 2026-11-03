@@ -132,15 +132,25 @@ public final class Tasks {
     public void markRead(final String cid, final long seq) {
         db.tx(new Runnable() {
             @Override public void run() {
-                db.exec("UPDATE conversations SET last_read_seq = MAX(last_read_seq, ?) WHERE id = ?", seq, cid);
-                db.exec("UPDATE tasks SET unread = 0 WHERE conversation_id = ?", cid);
+                // Only rows that change: this runs on every chat refresh, and rewriting every task of a long chat each time added up.
+                db.exec("UPDATE conversations SET last_read_seq = ? WHERE id = ? AND last_read_seq < ?", seq, cid, seq);
+                db.exec("UPDATE tasks SET unread = 0 WHERE conversation_id = ? AND unread != 0", cid);
             }
         });
     }
 
     // ----------------------------------------------------------------- messages
     public List<JSONObject> messages(String cid, long after, int limit) {
-        List<JSONObject> rows = db.all("SELECT * FROM messages WHERE conversation_id = ? AND seq > ? ORDER BY seq LIMIT ?", cid, after, limit);
+        return decorate(db.all("SELECT * FROM messages WHERE conversation_id = ? AND seq > ? ORDER BY seq LIMIT ?", cid, after, limit));
+    }
+
+    /** The newest `limit` messages (before seq `before`, if > 0), oldest first: a chat opens at its end without loading all of it. */
+    public List<JSONObject> lastMessages(String cid, long before, int limit) {
+        return decorate(db.all("SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?) ORDER BY seq",
+                cid, before > 0 ? before : Long.MAX_VALUE, limit));
+    }
+
+    List<JSONObject> decorate(List<JSONObject> rows) {
         for (JSONObject r : rows) {
             J.put(r, "mentions", J.parseArr(r.optString("mentions_json")));
             J.put(r, "attachments", J.parseArr(r.optString("attachments_json")));
@@ -262,8 +272,14 @@ public final class Tasks {
 
     /** Steering messages for a task, oldest first. */
     public List<JSONObject> steerMessages(String taskId) {
-        return db.all("SELECT id, text, created_at, attachments_json FROM messages WHERE author_type = 'user' AND meta_json LIKE ? ORDER BY seq",
-                "%\"steer\":\"" + taskId + "\"%");
+        // Steering is a later message in the task's own chat: search only there, after the message that started the task
+        // (this runs on every model step; searching all messages of all chats got slower with every message sent).
+        JSONObject t = db.one("SELECT conversation_id, source_message_id FROM tasks WHERE id = ?", taskId);
+        String cid = t == null ? null : J.str(t, "conversation_id", null);
+        if (cid == null) return new ArrayList<JSONObject>();
+        String from = J.str(t, "source_message_id", null) == null ? null : db.scalar("SELECT seq FROM messages WHERE id = ?", t.optString("source_message_id"));
+        return db.all("SELECT id, text, created_at, attachments_json FROM messages WHERE conversation_id = ? AND seq > ? AND author_type = 'user' AND meta_json LIKE ? ORDER BY seq",
+                cid, from == null ? 0 : Long.parseLong(from), "%\"steer\":\"" + taskId + "\"%");
     }
 
     List<JSONObject> route(JSONObject conv, List<String> mentions) {

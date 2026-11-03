@@ -154,6 +154,13 @@ public class SelfTest extends BroadcastReceiver {
         check(dup.optBoolean("duplicate") && dup.optString("message_id").equals(sent.optString("message_id")), "client_msg_id idempotent");
         b.engine.drain(20000);
         check(lastBotMessage(b, cid).optString("text").equals("[mock] hello there"), "bot replies");
+        // A long chat opens at its end: ?tail=N gives the newest N messages (and before=seq the ones above them).
+        JSONArray tail = api(r, "GET", "/api/v2/conversations/" + cid + "/messages?tail=1", null).optJSONArray("items");
+        JSONArray above = api(r, "GET", "/api/v2/conversations/" + cid + "/messages?tail=5&before=" + tail.optJSONObject(0).optLong("seq"), null).optJSONArray("items");
+        check(tail.length() == 1 && "[mock] hello there".equals(tail.optJSONObject(0).optString("text"))
+                && above.length() == 1 && "hello there".equals(above.optJSONObject(0).optString("text")), "messages tail and before");
+        check(b.core.db.count("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_runs_task', 'idx_tasks_created', 'idx_tasks_conv')") == 3,
+                "indexes for runs by task and tasks by time/chat");
 
         // 2. workspace tool
         api(r, "POST", "/api/v2/conversations/" + cid + "/messages", J.obj("text", "write a file"));

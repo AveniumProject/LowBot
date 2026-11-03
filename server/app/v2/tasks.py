@@ -116,9 +116,18 @@ class TaskService:
 
     # -- messages ------------------------------------------------------------
     def messages(self, conv_id: str, after_seq: int = 0, limit: int = 200) -> List[Dict[str, Any]]:
-        rows = self.db.all(
+        return self._decorate(self.db.all(
             "SELECT * FROM messages WHERE conversation_id = ? AND seq > ? ORDER BY seq LIMIT ?",
-            (conv_id, after_seq, limit))
+            (conv_id, after_seq, limit)))
+
+    def last_messages(self, conv_id: str, before_seq: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """The newest `limit` messages before `before_seq` (0 = all), oldest first."""
+        return self._decorate(self.db.all(
+            "SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?) ORDER BY seq",
+            (conv_id, before_seq if before_seq > 0 else 2 ** 62, limit)))
+
+    @staticmethod
+    def _decorate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for r in rows:
             r["mentions"] = loads(r.pop("mentions_json"), [])
             r["attachments"] = loads(r.pop("attachments_json"), [])

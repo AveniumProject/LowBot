@@ -58,6 +58,19 @@ def test_message_flow_and_idempotent_post(client):
     assert tree["run"]["status"] == "completed" and tree["steps"][0]["kind"] == "model"
 
 
+def test_messages_tail_opens_a_long_chat_at_its_end(client):
+    b, conv = setup_bot(client, [{"reply": "ok {{last}}"}])
+    url = f"/api/v2/conversations/{conv['id']}/messages"
+    for i in range(3):
+        client.post(url, json={"text": f"m{i}"})
+        wait(lambda: len(client.get(url, params={"limit": 500}).json()) == 2 * (i + 1))
+    tail = client.get(url, params={"tail": 2}).json()
+    assert [m["text"] for m in tail] == ["m2", "ok m2"]  # the newest, oldest first
+    older = client.get(url, params={"tail": 2, "before": tail[0]["seq"]}).json()
+    assert [m["text"] for m in older] == ["m1", "ok m1"]
+    assert [m["text"] for m in client.get(url, params={"after": tail[0]["seq"]}).json()] == ["ok m2"]
+
+
 def test_approval_over_http(client):
     b, conv = setup_bot(client, [{"when": "remember", "call": {"name": "memory.save", "arguments": {"content": "x"}}},
                                  {"on": "tool", "reply": "stored"}],

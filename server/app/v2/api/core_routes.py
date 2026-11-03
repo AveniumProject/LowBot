@@ -160,12 +160,15 @@ def add_member(conv_id: str, body: Dict[str, str], request: Request):
 
 
 @router.get("/conversations/{conv_id}/messages")
-def get_messages(conv_id: str, request: Request, after: int = 0, limit: int = Query(200, le=500)):
+def get_messages(conv_id: str, request: Request, after: int = 0, limit: int = Query(200, le=500),
+                 tail: Optional[int] = Query(None, ge=1, le=500), before: int = 0):
     r = rt(request)
     try:
         r.services["tasks"].get_conversation(conv_id)
     except TaskError as exc:
         raise bad(exc, 404)
+    if tail is not None:  # the newest `tail` messages (before seq `before`): a chat opens at its end
+        return r.services["tasks"].last_messages(conv_id, before, tail)
     return r.services["tasks"].messages(conv_id, after, limit)
 
 

@@ -228,7 +228,7 @@ function MediaTabs({ tab, conversationId, pl, tick }) {
   useEffect(() => {
     if (!conversationId) return;
     api(`/artifacts?conversation_id=${conversationId}`).then(setArts).catch(() => {});
-    if (tab === 'links') api(`/conversations/${conversationId}/messages?limit=500`).then(setMsgs).catch(() => {});
+    if (tab === 'links') api(`/conversations/${conversationId}/messages?tail=500`).then(setMsgs).catch(() => {});
   }, [conversationId, tab, tick]);
   const links = useMemo(() => {
     const seen = new Map();
