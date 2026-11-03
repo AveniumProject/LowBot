@@ -408,8 +408,10 @@ public class SelfTest extends BroadcastReceiver {
         check("completed".equals(b.core.db.scalar("SELECT status FROM tasks WHERE id = ?", tOld.optString("id"))), "no run time limit: a run past its old deadline completes");
 
         // 7e4. Stop during a slow model call ends the run at once (it used to wait for the provider's answer while the
-        // bot still counted as working), and nothing is left running afterwards.
-        JSONObject tSlow = api(r, "POST", "/api/v2/conversations/" + cid + "/messages", J.obj("text", "think slowly")).optJSONArray("tasks").getJSONObject(0);
+        // bot still counted as working), and nothing is left running afterwards. Its own chat: the history of a chat is
+        // sent with every later request, so "think slowly" would make the mock slow for the tests after this one.
+        String cidSlow = api(r, "POST", "/api/v2/conversations", J.obj("kind", "group", "title", "slow", "bot_ids", new JSONArray().put(bot.optString("id")))).optString("id");
+        JSONObject tSlow = api(r, "POST", "/api/v2/conversations/" + cidSlow + "/messages", J.obj("text", "think slowly")).optJSONArray("tasks").getJSONObject(0);
         long until = System.currentTimeMillis() + 10000;
         while (b.core.db.count("SELECT COUNT(*) FROM runs WHERE task_id = ? AND status = 'running' AND phase != ''", tSlow.optString("id")) == 0
                 && System.currentTimeMillis() < until) Thread.sleep(50);
